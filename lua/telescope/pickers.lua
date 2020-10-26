@@ -7,11 +7,13 @@ local actions = require('telescope.actions')
 local config = require('telescope.config')
 local debounce = require('telescope.debounce')
 local resolve = require('telescope.config.resolve')
-local layout_strategies = require('telescope.pickers.layout_strategies')
 local log = require('telescope.log')
 local mappings = require('telescope.mappings')
 local state = require('telescope.state')
 local utils = require('telescope.utils')
+
+local picker_display = require('telescope.pickers.display')
+local layout_strategies = require('telescope.pickers.layout_strategies')
 
 local EntryManager = require('telescope.entry_manager')
 
@@ -61,7 +63,7 @@ function Picker:new(opts)
 
   local layout_strategy = get_default(opts.layout_strategy, config.values.layout_strategy)
 
-  return setmetatable({
+  local obj = setmetatable({
     prompt_title = get_default(opts.prompt_title, "Prompt"),
     results_title = get_default(opts.results_title, "Results"),
     preview_title = get_default(opts.preview_title, "Preview"),
@@ -77,6 +79,7 @@ function Picker:new(opts)
 
     _completion_callbacks = {},
 
+    iteration = 0,
     track = get_default(opts.track, false),
     stats = {},
 
@@ -94,10 +97,6 @@ function Picker:new(opts)
     ) or {},
 
     window = {
-      -- TODO: This won't account for different layouts...
-      -- TODO: If it's between 0 and 1, it's a percetnage.
-      -- TODO: If its's a single number, it's always that many columsn
-      -- TODO: If it's a list, of length 2, then it's a range of min to max?
       height = get_default(opts.height, 0.8),
       width = get_default(opts.width, config.values.width),
 
@@ -116,6 +115,16 @@ function Picker:new(opts)
 
     preview_cutoff = get_default(opts.preview_cutoff, config.values.preview_cutoff),
   }, self)
+
+
+  -- TODO: I'm not so sure I like how this looks... but I like that we're inling all calculations ahead of time.
+  obj.can_select_row = picker_display.bind_can_select_row(obj)
+  obj.get_row = picker_display.bind_get_row(obj)
+  obj.get_index = picker_display.bind_get_index(obj)
+  obj.get_reset_row = picker_display.bind_get_reset_row(obj)
+  obj.handle_scroll_strategy = picker_display.bind_handle_strategy(obj)
+
+  return obj
 end
 
 function Picker:_get_initial_window_options()
@@ -156,38 +165,8 @@ function Picker:get_window_options(max_columns, max_lines)
   return getter(self, max_columns, max_lines)
 end
 
---- Take a row and get an index.
----@note: Rows are 0-indexed, and `index` is 1 indexed (table index)
----@param index number: The row being displayed
----@return number The row for the picker to display in
-function Picker:get_row(index)
-  if self.sorting_strategy == 'ascending' then
-    return index - 1
-  else
-    return self.max_results - index
-  end
-end
 
---- Take a row and get an index
----@note: Rows are 0-indexed, and `index` is 1 indexed (table index)
----@param row number: The row being displayed
----@return number The index in line_manager
-function Picker:get_index(row)
-  if self.sorting_strategy == 'ascending' then
-    return row + 1
-  else
-    return self.max_results - row
-  end
-end
-
-function Picker:get_reset_row()
-  if self.sorting_strategy == 'ascending' then
-    return 0
-  else
-    return self.max_results - 1
-  end
-end
-
+-- TODO: Bind
 function Picker:clear_extra_rows(results_bufnr)
   if not a.nvim_buf_is_valid(results_bufnr) then
     log.debug("Invalid results_bufnr for clearing:", results_bufnr)
@@ -261,14 +240,6 @@ function Picker:highlight_one_row(results_bufnr, prompt, display, row)
         finish
       )
     end
-  end
-end
-
-function Picker:can_select_row(row)
-  if self.sorting_strategy == 'ascending' then
-    return row <= self.manager:num_results()
-  else
-    return row <= self.max_results and row >= self.max_results - self.manager:num_results()
   end
 end
 
@@ -352,9 +323,11 @@ function Picker:find()
   a.nvim_buf_set_lines(results_bufnr, 0, self.max_results, false, utils.repeated_table(self.max_results, ""))
 
   local status_updater = self:get_status_updater(prompt_win, prompt_bufnr)
-  local debounced_status_updater = debounce.throttle_leading(status_updater, 50)
 
   local on_lines = function(_, _, _, first_line, last_line)
+    self.iteration = self.iteration + 1
+    log.debug("ITERATION:", self.iteration)
+
     self:_reset_track()
 
     if not a.nvim_buf_is_valid(prompt_bufnr) then
@@ -371,6 +344,7 @@ function Picker:find()
       log.debug("ON_LINES: Weird other lines", last_line)
     end
 
+    -- TODO: Start a count for the iteration we are on. That's the true way to know if we're in the right iteration.
     local prompt = vim.trim(a.nvim_buf_get_lines(prompt_bufnr, first_line, last_line, false)[1]:sub(#prompt_prefix))
 
     if self.sorter then
@@ -380,7 +354,7 @@ function Picker:find()
     -- TODO: Entry manager should have a "bulk" setter. This can prevent a lot of redraws from display
     self.manager = EntryManager:new(self.max_results, self.entry_adder, self.stats)
 
-    local process_result = self:get_result_processor(prompt, debounced_status_updater)
+    local process_result = self:get_result_processor(prompt, status_updater)
     local process_complete = self:get_result_completor(results_bufnr, prompt, status_updater)
 
     local ok, msg = pcall(function()
@@ -549,28 +523,10 @@ function Picker:reset_selection()
   self.multi_select = {}
 end
 
-function Picker:_handle_scroll_strategy(row)
-  if self.scroll_strategy == "cycle" then
-    if row >= self.max_results then
-      row = 0
-    elseif row < 0 then
-      row = self.max_results - 1
-    end
-  else
-    if row >= self.max_results then
-      row = self.max_results - 1
-    elseif row < 0 then
-      row = 0
-    end
-  end
-
-  return row
-end
-
 function Picker:set_selection(row)
   -- TODO: Loop around behavior?
   -- TODO: Scrolling past max results
-  row = self:_handle_scroll_strategy(row)
+  row = self:handle_scroll_strategy(row)
 
   if not self:can_select_row(row) then
     log.debug("Cannot select row:", row, self.manager:num_results(), self.max_results)
@@ -746,7 +702,9 @@ function Picker:get_status_updater(prompt_win, prompt_bufnr)
   end
 end
 
-function Picker:get_result_processor(prompt, debounced_status_updater)
+function Picker:get_result_processor(prompt, status_updater)
+  local debounced_status_updater = debounce.throttle_leading(status_updater, 10000)
+
   return function(entry)
     self:_increment("processed")
 
